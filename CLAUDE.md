@@ -15,11 +15,15 @@ changed. Built in three slices:
   channels, and guarded actions. Credentials moved to environment variables
   here rather than waiting for slice 3, because a channel cannot send without
   one and the wrong habit is hard to undo later.
-- **Slice 3 (not started): control and deploy.** Cost and model routing, agent
-  sandboxing, recovery from failure, CI, a pre-launch checklist, and always-on
-  hosting.
+- **Slice 3 (done): control and deploy.** A pre-launch checklist that runs, a
+  secret scanner, CI across Python 3.10-3.13, a container image, a Render
+  blueprint, and settings that can arrive as an environment variable.
+  [DEPLOY.md](DEPLOY.md) and [MAINTENANCE.md](MAINTENANCE.md) carry the
+  operational guidance.
 
-Do not build slice 3 work into earlier files without being asked.
+All three slices are complete. New work is a change to a finished project, not
+a continuation of a slice: propose it, and keep the decisions below intact
+unless we agree otherwise.
 
 ## Architecture decisions
 
@@ -89,6 +93,31 @@ Added in slice 2:
 - **State v1 files are upgraded on read, not rejected.** Losing the baseline on
   an upgrade would mean missing the next real change.
 
+Added in slice 3:
+
+- **The pre-launch checklist is code, not prose.** A checklist you have to
+  remember to follow is one you will eventually skip. `preflight` exits non-zero
+  so a deploy script can refuse.
+- **Preflight distinguishes FAIL from WARN.** FAIL means it will not work or
+  will do something unintended. WARN means it works but you owe it a decision.
+  Warnings never block; padding the FAIL list would teach people to ignore it.
+- **The snapshot's durability is a first-class check.** Most hosts give a
+  deployment a fresh filesystem. A watcher that loses its snapshot re-baselines
+  forever and never reports a change, with no error anywhere. This is the
+  single most likely way a deployment of this app fails.
+- **The secret scanner tolerates placeholders on purpose.** A scanner with a
+  high false-positive rate gets ignored within a day, which is worse than none.
+  It is a net, not a proof -- never describe a clean scan as a guarantee.
+- **`scan-secrets` runs without a config**, because that is exactly the
+  situation in CI: `config.json` is git-ignored and absent from a checkout.
+- **CI tests the Python floor the README claims.** 3.10 is in the matrix so the
+  claim is verified rather than hopeful. If you raise the floor, change both.
+- **An explicit `--config` always beats `WATCHER_CONFIG`.** A deployment
+  variable must never silently shadow a file someone deliberately pointed at.
+- **The startup line and the HTTP status exist for log dashboards.** After a
+  deploy the only evidence available is the host's log; it has to show that the
+  app started, found its settings, and actually reached the site.
+
 ## Behavioural rules
 
 - **Propose a plan before editing code.** Say which files you will touch and
@@ -134,6 +163,8 @@ conflict on your own.
 
 ```bash
 python -m unittest discover -v      # all tests
+python -m watcher preflight         # the pre-launch checklist
+python -m watcher scan-secrets      # credentials in tracked files
 python -m watcher check             # one live check
 python -m watcher test-notify       # prove the alert path without a real change
 python -m watcher show --log        # what was stored, and recent runs

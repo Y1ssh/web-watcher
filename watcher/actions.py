@@ -49,6 +49,9 @@ _ENCODINGS = ("form", "json")
 #: Config keys that would mean a credential was written into the file.
 _FORBIDDEN_SECRET_KEYS = ("password", "token", "secret", "api_key", "authorization")
 
+#: ${NAME} in a header value, resolved from the environment at send time.
+_ENV_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
 
 class ActionError(WatcherError):
     """The action was attempted and failed."""
@@ -104,6 +107,19 @@ class Action:
     def describe(self) -> str:
         names = ", ".join(sorted(self.fields)) or "no fields"
         return f"{self.method} {self.url} ({names})"
+
+    def required_env(self) -> tuple[str, ...]:
+        """Environment variables named by ${...} placeholders in the headers.
+
+        The pre-launch check reads this so a missing token is found before
+        deployment, not at the moment the action tries to fire.
+        """
+        names: list[str] = []
+        for value in self.headers.values():
+            for match in _ENV_PLACEHOLDER.finditer(value):
+                if match.group(1) not in names:
+                    names.append(match.group(1))
+        return tuple(names)
 
 
 def build_action(spec: Any, *, force_dry_run: bool = False) -> Action:
@@ -409,7 +425,7 @@ def _expand(value: str) -> str:
         name = match.group(1)
         return secrets.require(name, used_for=f"the ${{{name}}} header value")
 
-    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", substitute, value)
+    return _ENV_PLACEHOLDER.sub(substitute, value)
 
 
 def record_run(previous: tuple[str, ...], now: str) -> tuple[str, ...]:

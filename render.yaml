@@ -1,0 +1,35 @@
+# Render Blueprint. In the dashboard: New -> Blueprint -> pick this repository.
+#
+# A worker rather than a cron job, on purpose. The watcher has to remember what
+# it saw last time, and a scheduled job that gets a fresh filesystem every run
+# would re-baseline on every run and never report a change. A worker with a
+# mounted disk keeps the snapshot across restarts and deploys.
+services:
+  - type: worker
+    name: web-watcher
+    runtime: python
+
+    # Never deploy over a red check: a failing build here blocks the deploy.
+    buildCommand: "python -m unittest discover"
+    startCommand: "python -m watcher watch"
+
+    disk:
+      name: watcher-state
+      mountPath: /data
+      sizeGB: 1
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+      # The settings themselves. The config holds no credentials by design, so
+      # it is safe to paste into a dashboard field.
+      - key: WATCHER_CONFIG
+        sync: false
+
+      # Credentials. sync:false means "ask me in the dashboard" -- the value is
+      # never written into this file.
+      - key: WATCHER_WEBHOOK_URL
+        sync: false

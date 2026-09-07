@@ -1,0 +1,16 @@
+{
+  "url": "https://example.com/product",
+  "extractor": { "kind": "element", "tag": "div", "id": "price" },
+  "condition": { "kind": "number", "below": 50 },
+  "interval_seconds": 900,
+
+  "state_path": "/data/snapshot.json",
+  "log_path": "/data/runs.jsonl",
+
+  "notify": {
+    "channels": [
+      { "kind": "console" },
+      { "kind": "webhook", "url_env": "WATCHER_WEBHOOK_URL" }
+    ]
+  }
+}

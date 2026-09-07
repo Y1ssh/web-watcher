@@ -1,5 +1,7 @@
 # Web Watcher
 
+[![tests](https://github.com/Y1ssh/web-watcher/actions/workflows/tests.yml/badge.svg)](https://github.com/Y1ssh/web-watcher/actions/workflows/tests.yml)
+
 Watches one value on one web page, tells you when it changes in a way you care
 about, and — if you ask it to — does something about it.
 
@@ -7,9 +9,11 @@ Point it at a URL, say which part of the page matters, write the rule that makes
 a change worth hearing about, and it fetches, compares, decides, alerts, and
 optionally acts. Everything it records is plain JSON you can open and read.
 
-This is **slice 2 of 3**. Slice 1 monitored and reported; slice 2 adds
-conditions, notifications, and guarded actions. Slice 3 brings production
-hardening and always-on hosting.
+All three slices are complete: slice 1 monitored and reported, slice 2 added
+conditions, notifications and guarded actions, and slice 3 added the production
+controls and everything needed to run it somewhere that stays on. See
+**[DEPLOY.md](DEPLOY.md)** to put it live and **[MAINTENANCE.md](MAINTENANCE.md)**
+to keep it that way.
 
 ---
 
@@ -280,10 +284,13 @@ cannot override a deployment's platform settings.
 | `python -m watcher show` | Print the stored snapshot without fetching. |
 | `python -m watcher reset --yes` | Delete the snapshot so the next check re-baselines. |
 | `python -m watcher reset --action-only --yes` | Clear the action guards, keeping the value baseline. |
+| `python -m watcher preflight` | Run the pre-launch checklist. Exits non-zero on a real problem. |
+| `python -m watcher scan-secrets` | Look for credentials written into tracked files. |
 
 Useful flags:
 
-- `--config PATH` — use a different config file.
+- `--config PATH` — use a different config file. Without it, settings come from
+  the `WATCHER_CONFIG` environment variable if set, then from `config.json`.
 - `--url URL` — override the configured URL for one run.
 - `--dry-run` (`check`, `watch`) — force rehearsal mode for this run.
 - `--interval SECONDS` (`watch`) — override the interval.
@@ -328,9 +335,23 @@ is being measured.
 python -m unittest discover -v
 ```
 
-398 tests, no internet access required. The end-to-end tests run against real
+498 tests, no internet access required. The end-to-end tests run against real
 HTTP servers started on localhost, so a test can watch a page change, see the
 alert fire, and confirm the action really did or did not post.
+
+CI runs the same suite on every push across Python 3.10–3.13 on Linux plus 3.13
+on Windows, scans for hardcoded credentials, and builds the container image.
+
+### 1b. The pre-launch checklist
+
+```bash
+python -m watcher preflight
+```
+
+Checks secrets, `.gitignore`, environment variables, the snapshot's durability,
+channels, action mode, interval, and — by default — actually fetches the live
+page and reads the value out of it. It exits non-zero if something would really
+break, so a deploy script can refuse. Add `--offline` in CI.
 
 ### 2. Prove the alert path before you rely on it
 
@@ -386,6 +407,8 @@ actions.py      the guarded HTTP request
 checker.py      one full cycle: fetch, extract, compare, decide, alert, act
 schedule.py     repeats a check on a fixed interval without drifting
 runlog.py       appends one JSON object per run
+secretscan.py   finds credentials written into files instead of the environment
+preflight.py    the pre-launch checklist, as code rather than a document
 cli.py          the command line
 ```
 
@@ -407,13 +430,31 @@ next run.
 
 All are machine-local and git-ignored, along with `config.json` itself.
 
-## Deliberate limits in this slice
+## Deploying
 
-- `watch` only runs while the process runs. Always-on hosting is slice 3.
+`python -m watcher watch` only runs while the process runs. To watch a page
+around the clock it has to live somewhere that stays on.
+
+The repository ships a `Dockerfile`, a `render.yaml` blueprint, and
+`config.production.example.json`. **Read [DEPLOY.md](DEPLOY.md) first** — in
+particular the section on where the snapshot lives. Most hosts hand a
+deployment a fresh filesystem, and a watcher that loses its snapshot re-baselines
+on every run and never reports a change. Nothing errors; you simply never get
+told.
+
+Settings reach the host either as the `WATCHER_CONFIG` environment variable or
+as a committed `config.production.json`. Both are safe, because the config holds
+no credentials by design — those live in the host's environment settings.
+
+## Known limits
+
 - Pages that build their content with JavaScript after loading will not work.
   The watcher reads the HTML the server sends, which is what a browser receives
   before scripts run.
 - An action is an HTTP request. That covers plain HTML forms and APIs, but not
   clicking a button on a JavaScript-driven page — that needs a real browser, and
-  therefore a third-party dependency this project has so far avoided. Worth a
-  deliberate decision rather than a quiet one.
+  therefore a third-party dependency this project has deliberately avoided.
+- `scan-secrets` is a net, not a proof. A clean result means nothing obvious was
+  found, not that nothing is there.
+- Number parsing handles Anglo notation by default and European notation behind
+  `decimal_comma`. Anything else returns unknown rather than a guess.

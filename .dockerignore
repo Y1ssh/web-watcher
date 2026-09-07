@@ -1,0 +1,16 @@
+# Keep credentials, personal settings, and runtime data out of the image.
+.env
+.env.*
+config.json
+state/
+logs/
+
+# Nothing here is needed at runtime.
+.git
+.github
+tests/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.md

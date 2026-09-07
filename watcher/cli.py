@@ -3,6 +3,7 @@
 import argparse
 import dataclasses
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -15,9 +16,11 @@ from . import (
     config as config_module,
     extract,
     notify,
+    preflight,
     runlog,
     schedule,
     secrets,
+    secretscan,
     state,
 )
 from .actions import ActionStatus
@@ -117,6 +120,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_arguments(test_notify)
 
+    preflight_command = subcommands.add_parser(
+        "preflight",
+        help="run the pre-launch checklist before deploying",
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_common_arguments(preflight_command)
+    preflight_command.add_argument(
+        "--offline",
+        action="store_true",
+        help="skip the live page check (for CI, which may have no network)",
+    )
+    preflight_command.add_argument(
+        "--project",
+        type=Path,
+        metavar="DIR",
+        help="project root to scan (default: the config file's directory)",
+    )
+
+    scan = subcommands.add_parser(
+        "scan-secrets",
+        help="look for credentials written into files instead of the environment",
+    )
+    scan.add_argument(
+        "--path",
+        type=Path,
+        default=Path("."),
+        metavar="DIR",
+        help="directory to scan (default: %(default)s)",
+    )
+
     return parser
 
 
@@ -124,9 +158,10 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(config_module.DEFAULT_CONFIG_FILENAME),
+        default=None,
         metavar="PATH",
-        help="configuration file (default: %(default)s)",
+        help=f"configuration file (default: {config_module.DEFAULT_CONFIG_FILENAME}, "
+             f"or the {config_module.CONFIG_ENV_VAR} environment variable)",
     )
     parser.add_argument("--url", metavar="URL", help="override the configured url")
     parser.add_argument(
@@ -151,9 +186,14 @@ def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int
     args = parser.parse_args(argv)
     out = stream if stream is not None else sys.stdout
 
+    # Scanning for secrets must work on a checkout with no config at all --
+    # that is exactly the situation CI runs in.
+    if args.command == "scan-secrets":
+        return _command_scan_secrets(args, out)
+
     try:
-        secrets.load_env_file(
-            args.config.parent / secrets.DEFAULT_ENV_FILENAME
+        args.env_loaded = secrets.load_env_file(
+            _env_dir(args) / secrets.DEFAULT_ENV_FILENAME
         )
         settings = _bind_console(_load_config(args), out)
     except ConfigError as exc:
@@ -166,6 +206,7 @@ def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int
         "show": _command_show,
         "reset": _command_reset,
         "test-notify": _command_test_notify,
+        "preflight": _command_preflight,
     }
     try:
         return handlers[args.command](settings, args, out)
@@ -200,10 +241,30 @@ def _bind_console(
     return dataclasses.replace(settings, notify_channels=channels)
 
 
+def _env_dir(args: argparse.Namespace) -> Path:
+    """Where to look for a .env file: next to the config, else the working dir."""
+    return args.config.parent if args.config is not None else Path.cwd()
+
+
 def _load_config(args: argparse.Namespace) -> config_module.Config:
-    settings = config_module.load(
-        args.config, force_dry_run=bool(getattr(args, "dry_run", False))
-    )
+    """Resolve the config from --config, then the environment, then the default.
+
+    An explicit --config always wins, so a deployment's WATCHER_CONFIG cannot
+    silently shadow a file you deliberately pointed at.
+    """
+    force_dry_run = bool(getattr(args, "dry_run", False))
+    if args.config is not None:
+        settings = config_module.load(args.config, force_dry_run=force_dry_run)
+    else:
+        settings = config_module.load_from_env(
+            base_dir=Path.cwd(), force_dry_run=force_dry_run
+        )
+        if settings is None:
+            settings = config_module.load(
+                Path(config_module.DEFAULT_CONFIG_FILENAME),
+                force_dry_run=force_dry_run,
+            )
+
     overrides: dict[str, Any] = {}
     if args.url:
         overrides["url"] = args.url
@@ -238,6 +299,34 @@ def _confirm_fn(out: TextIO):
         return answer.strip().lower() == "go"
 
     return ask
+
+
+def _print_startup(
+    settings: config_module.Config, args: argparse.Namespace, out: TextIO
+) -> None:
+    """The three things to confirm in a host's log dashboard after a deploy.
+
+    Started, found its settings, and knows where its memory lives. The third --
+    that it actually reached the site -- shows up on the first check's own line.
+    """
+    if settings.source is not None:
+        source = str(settings.source)
+    elif os.environ.get(config_module.CONFIG_ENV_VAR):
+        source = f"${config_module.CONFIG_ENV_VAR}"
+    else:
+        source = "defaults"
+
+    loaded = getattr(args, "env_loaded", []) or []
+    environment = (
+        f"{len(loaded)} variable(s) from .env"
+        if loaded
+        else "using the platform environment"
+    )
+    print(
+        f"web-watcher starting | config: {source} | {environment} | "
+        f"state: {settings.state_path}",
+        file=out,
+    )
 
 
 def _print_mode_banner(settings: config_module.Config, out: TextIO) -> None:
@@ -278,6 +367,7 @@ def _command_watch(
         print("--max-runs must be at least 1", file=out)
         return EXIT_CONFIG
 
+    _print_startup(settings, args, out)
     _print_mode_banner(settings, out)
     print(
         f"watching {settings.describe_target()} "
@@ -458,9 +548,43 @@ def _command_test_notify(
     return EXIT_FETCH
 
 
+def _command_preflight(
+    settings: config_module.Config, args: argparse.Namespace, out: TextIO
+) -> int:
+    root = args.project
+    if root is None:
+        root = settings.source.parent if settings.source is not None else Path.cwd()
+    report = preflight.run(settings, project_root=root, offline=args.offline)
+    print(preflight.format_report(report, root), file=out)
+    return EXIT_OK if report.ok else EXIT_CONFIG
+
+
+def _command_scan_secrets(args: argparse.Namespace, out: TextIO) -> int:
+    """Runs without a config, so CI can check a bare checkout."""
+    root = args.path
+    if not root.exists():
+        print(f"no such directory: {root}", file=out)
+        return EXIT_CONFIG
+    findings, how = secretscan.scan_repository(root)
+    if not findings:
+        print(f"no credential-shaped values found in {how} under {root}", file=out)
+        return EXIT_OK
+    print(f"{len(findings)} possible credential(s) in {how} under {root}:", file=out)
+    for finding in findings:
+        print(f"  {finding.describe(root)}", file=out)
+    print(
+        "\nMove each value into an environment variable. Anything already "
+        "pushed should be treated as public: rotate it as well as removing it.",
+        file=out,
+    )
+    return EXIT_CONFIG
+
+
 def _report(result: checker.Check, out: TextIO) -> None:
     print(_HEADLINE[result.outcome], file=out)
-    print(f"  url:   {result.page_url}", file=out)
+    # The status code is what proves the site was actually reached, which is
+    # the one thing easiest to miss when reading a host's logs after a deploy.
+    print(f"  url:   {result.page_url} (HTTP {result.status})", file=out)
     if result.outcome is Outcome.CHANGED:
         print(f"  from:  {extract.truncate(result.previous_value or '')}", file=out)
         print(f"  to:    {extract.truncate(result.value)}", file=out)

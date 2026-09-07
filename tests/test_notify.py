@@ -223,12 +223,12 @@ class EmailChannelTests(EnvTestCase):
 
     def test_credentials_come_from_the_environment(self):
         os.environ["TEST_SMTP_USER"] = "user@example.com"
-        os.environ["TEST_SMTP_PASSWORD"] = "hunter2"
+        os.environ["TEST_SMTP_PASSWORD"] = "placeholder-not-a-secret"
         self._channel(
             username_env="TEST_SMTP_USER", password_env="TEST_SMTP_PASSWORD"
         ).send(NOTE)
         self.assertEqual(
-            FakeSMTP.instances[0].login_args, ("user@example.com", "hunter2")
+            FakeSMTP.instances[0].login_args, ("user@example.com", "placeholder-not-a-secret")
         )
 
     def test_no_login_when_no_credentials_are_configured(self):
@@ -359,7 +359,7 @@ class BuildChannelTests(unittest.TestCase):
                     "to": "a@b.c",
                     "from": "d@e.f",
                     "host": "smtp.example.com",
-                    "password": "hunter2",
+                    "password": "placeholder-not-a-secret",
                 },
                 base_dir=self.BASE,
             )

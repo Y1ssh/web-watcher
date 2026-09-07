@@ -1,0 +1,69 @@
+name: tests
+
+# A green run here is the objective evidence that the app works. Nothing gets
+# deployed over a red check.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        # 3.10 is the floor the README claims; testing it is what makes the
+        # claim true rather than hopeful.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # The project is developed on Windows, so one Windows job guards the
+          # path handling and atomic-replace behaviour that differ there.
+          - os: windows-latest
+            python-version: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Confirm there is nothing to install
+        run: python -c "import watcher; print('standard library only')"
+
+      - name: Run the test suite
+        run: python -m unittest discover -v
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The scanner reads git-tracked files; a shallow clone is enough.
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Scan tracked files for credentials
+        run: python -m watcher scan-secrets --path .
+
+  container:
+    name: container build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t web-watcher:ci .
+
+      - name: Confirm the image runs
+        run: docker run --rm web-watcher:ci python -m watcher --help

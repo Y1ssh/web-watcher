@@ -7,6 +7,7 @@ unattended run hours later. Unknown keys are rejected too: a typo like
 """
 
 import json
+import os
 import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -18,6 +19,12 @@ from .errors import ConfigError
 from .fetching import DEFAULT_TIMEOUT_SECONDS, DEFAULT_USER_AGENT
 
 DEFAULT_CONFIG_FILENAME = "config.json"
+
+#: Hosting platforms hand a deployment its settings as environment variables,
+#: not as files. Setting this to the config's JSON avoids having to get a file
+#: onto the host at all -- and the config holds no secrets by design, so there
+#: is nothing dangerous about it living in a platform settings panel.
+CONFIG_ENV_VAR = "WATCHER_CONFIG"
 
 #: Fifteen minutes. Often enough for most pages, gentle enough that the site
 #: being watched has no reason to treat the watcher as abusive.
@@ -117,6 +124,27 @@ def load(path: Path, *, force_dry_run: bool = False) -> Config:
 
     return from_mapping(
         data, base_dir=path.parent, source=path, force_dry_run=force_dry_run
+    )
+
+
+def load_from_env(*, base_dir: Path, force_dry_run: bool = False) -> Config | None:
+    """Build a config from the WATCHER_CONFIG variable, or return None.
+
+    Relative paths in an environment-supplied config resolve against the
+    current working directory, since there is no config file to anchor them to.
+    A deployment should use absolute paths such as /data/snapshot.json.
+    """
+    raw = os.environ.get(CONFIG_ENV_VAR)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(
+            f"{CONFIG_ENV_VAR} is set but is not valid JSON: {exc}"
+        ) from exc
+    return from_mapping(
+        data, base_dir=base_dir, source=None, force_dry_run=force_dry_run
     )
 
 

@@ -91,8 +91,10 @@ class BuildActionTests(unittest.TestCase):
         self.assertIn("feilds", str(caught.exception))
 
     def test_an_inline_token_is_refused(self):
+        # The literal is deliberately self-describing: the repository's own
+        # secret scanner runs over these files in CI.
         with self.assertRaises(ConfigError) as caught:
-            build_action(spec(token="secret-value"))
+            build_action(spec(token="placeholder-not-a-secret"))
         self.assertIn("config file", str(caught.exception))
 
     def test_fields_must_be_simple_values(self):

@@ -95,6 +95,14 @@ class Channel:
     def describe(self) -> str:
         return self.kind
 
+    def required_env(self) -> tuple[str, ...]:
+        """Environment variables this channel needs before it can send.
+
+        The pre-launch check reads this so a missing credential is found on the
+        ground rather than the first time an alert tries to go out.
+        """
+        return ()
+
 
 class ConsoleChannel(Channel):
     """Print to the terminal. Always available, needs no credentials."""
@@ -189,6 +197,9 @@ class WebhookChannel(Channel):
     def describe(self) -> str:
         return f"webhook(${self.url_env})"
 
+    def required_env(self) -> tuple[str, ...]:
+        return (self.url_env,)
+
 
 class EmailChannel(Channel):
     """Send mail over SMTP. The password is only ever an environment variable."""
@@ -252,6 +263,13 @@ class EmailChannel(Channel):
 
     def describe(self) -> str:
         return f"email({self.to})"
+
+    def required_env(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name in (self.username_env, self.password_env)
+            if name is not None
+        )
 
 
 # -- rendering -------------------------------------------------------------
