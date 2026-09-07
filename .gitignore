@@ -15,3 +15,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Machine-specific deployment scripts (they hold absolute paths).
+local/

@@ -180,6 +180,80 @@ The named volume is what makes the snapshot survive a restart. The image runs
 as a non-root user and sets `PYTHONUNBUFFERED=1`, so each run appears in the log
 dashboard as it happens rather than when a buffer happens to flush.
 
+### On your own machine (Windows scheduled task)
+
+The cheapest option, and a reasonable one if the machine is usually on. Windows
+Task Scheduler owns the schedule, so you run `check` rather than `watch` — no
+console window has to stay open, and the task survives a reboot.
+
+The local disk is durable, so the ephemeral-storage problem in section 1 does
+not apply here. `preflight` will still warn about it; that warning is aimed at
+hosted deployments and can be read and dismissed.
+
+**1. A launcher, so failures leave a trace.** Task Scheduler runs a program, not
+a shell, so redirection needs a wrapper. Put this in `local/run-check.cmd`
+(`local/` is git-ignored because the path is machine-specific):
+
+```bat
+@echo off
+setlocal
+cd /d "%~dp0.."
+if not exist "logs" mkdir "logs"
+echo [%date% %time%] run start >> "logs\task.out"
+"C:\path\to\python.exe" -m watcher check >> "logs\task.out" 2>&1
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] run finished, exit %RC% >> "logs\task.out"
+exit /b %RC%
+```
+
+Handing the exit code back matters: without it a crashed run looks to Task
+Scheduler like a success that happened to do nothing.
+
+**2. Register the task.**
+
+```powershell
+$root = "C:\path\to\web-watcher"
+$action = New-ScheduledTaskAction -Execute "$root\local\run-check.cmd" -WorkingDirectory $root
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 15)
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -Hidden
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName "WebWatcher" -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
+```
+
+Three of those settings are the difference between a watcher that works and one
+that quietly does not: `-AllowStartIfOnBatteries` and
+`-DontStopIfGoingOnBatteries` (Windows skips scheduled tasks on battery by
+default, so a laptop watcher would only run while plugged in), and
+`-StartWhenAvailable` (a run missed while the machine slept fires on wake
+instead of being dropped).
+
+Omit `-RepetitionDuration` to repeat indefinitely. Passing
+`[TimeSpan]::MaxValue` looks right but serialises to a duration Task Scheduler
+rejects.
+
+**3. Prove it runs**, rather than trusting that it will:
+
+```powershell
+Start-ScheduledTask -TaskName "WebWatcher"
+Get-ScheduledTaskInfo -TaskName "WebWatcher" | Select-Object LastRunTime, LastTaskResult, NextRunTime
+```
+
+`LastTaskResult` of `0` is success. Then confirm the watcher itself did
+something — `check_count` in `state/snapshot.json` should have gone up, and
+`logs/task.out` should have a new entry. A task that reports success while the
+snapshot stands still is a task running the wrong thing.
+
+**To remove it:**
+
+```powershell
+Unregister-ScheduledTask -TaskName "WebWatcher" -Confirm:$false
+```
+
+**The honest limit:** with `-LogonType Interactive` the task runs only while you
+are logged in, and only while the machine is awake. Close the lid overnight and
+it pauses until morning. That is the gap a real host fills, and the only reason
+to move it off your machine.
+
 Whichever route you take, ask the agent to narrate each step before it takes it.
 Deployment touches accounts, billing, and live credentials. When a secret needs
 pasting, paste it yourself — it should never pass through a conversation.
