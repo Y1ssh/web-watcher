@@ -1,0 +1,17 @@
+# Local configuration -- copy config.example.json to config.json and edit that.
+config.json
+
+# Runtime output: the saved snapshot and the run log are machine-local.
+state/
+logs/
+
+# Secrets (introduced in a later slice, ignored from the start).
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

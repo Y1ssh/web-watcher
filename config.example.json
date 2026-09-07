@@ -1,0 +1,11 @@
+{
+  "url": "https://example.com/",
+  "extractor": {
+    "kind": "element",
+    "tag": "h1"
+  },
+  "interval_seconds": 900,
+  "timeout_seconds": 20,
+  "state_path": "state/snapshot.json",
+  "log_path": "logs/runs.jsonl"
+}
