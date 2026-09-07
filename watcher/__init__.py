@@ -1,5 +1,6 @@
-"""Web Watcher: fetch a page, read one value from it, and report when it changes."""
+"""Web Watcher: fetch a page, read one value, report and act when it changes."""
 
+from .actions import ActionError
 from .errors import (
     ConfigError,
     ExtractionError,
@@ -7,11 +8,14 @@ from .errors import (
     StateError,
     WatcherError,
 )
+from .notify import NotifyError
 
 __all__ = [
+    "ActionError",
     "ConfigError",
     "ExtractionError",
     "FetchError",
+    "NotifyError",
     "StateError",
     "WatcherError",
 ]

@@ -17,8 +17,12 @@ from typing import Any
 
 from .errors import StateError
 
-#: Bumped whenever the stored shape changes, so an old file fails loudly.
-STATE_VERSION = 1
+#: Bumped whenever the stored shape changes.
+#: v1 = slice 1 (change detection only). v2 adds the notification and action
+#: bookkeeping. A v1 file is upgraded on read rather than rejected: losing the
+#: baseline on an upgrade would mean missing the next real change.
+STATE_VERSION = 2
+READABLE_VERSIONS = (1, 2)
 
 _TEXT_FIELDS = (
     "url",
@@ -28,7 +32,15 @@ _TEXT_FIELDS = (
     "first_seen_at",
     "last_checked_at",
 )
-_COUNT_FIELDS = ("check_count", "change_count")
+_COUNT_FIELDS = ("check_count", "change_count", "action_total_runs")
+
+#: Added in v2. A v1 snapshot is read with these defaults.
+_V2_DEFAULTS: dict[str, Any] = {
+    "last_notified_hash": None,
+    "last_notified_at": None,
+    "action_runs": (),
+    "action_total_runs": 0,
+}
 
 
 @dataclass(frozen=True)
@@ -45,8 +57,20 @@ class Snapshot:
     check_count: int
     change_count: int
 
+    #: Hash of the value the last notification was sent about. This is what
+    #: makes an alert fire once per change instead of on every single check.
+    last_notified_hash: str | None = None
+    last_notified_at: str | None = None
+
+    #: Timestamps of real (non-dry-run) action runs, oldest first, capped.
+    #: Persisted so the rate limit and run-once guard survive a restart.
+    action_runs: tuple[str, ...] = ()
+    action_total_runs: int = 0
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["action_runs"] = list(self.action_runs)
+        return data
 
     @classmethod
     def from_dict(cls, data: Any, source: Path | None = None) -> "Snapshot":
@@ -55,22 +79,35 @@ class Snapshot:
             raise StateError(f"snapshot{where} is not an object")
 
         fields = tuple(cls.__dataclass_fields__)
-        missing = sorted(set(fields) - set(data))
+        required = [name for name in fields if name not in _V2_DEFAULTS]
+        missing = sorted(set(required) - set(data))
         if missing:
             raise StateError(
                 f"snapshot{where} is missing field(s): {', '.join(missing)}"
             )
-        values = {name: data[name] for name in fields}
+        values = {
+            name: data.get(name, _V2_DEFAULTS.get(name)) for name in fields
+        }
 
         for name in _TEXT_FIELDS:
             if not isinstance(values[name], str):
                 raise StateError(f"snapshot{where}: {name!r} must be a string")
 
-        changed_at = values["last_changed_at"]
-        if changed_at is not None and not isinstance(changed_at, str):
+        for name in ("last_changed_at", "last_notified_hash", "last_notified_at"):
+            value = values[name]
+            if value is not None and not isinstance(value, str):
+                raise StateError(
+                    f"snapshot{where}: {name!r} must be a string or null"
+                )
+
+        runs = values["action_runs"]
+        if not isinstance(runs, (list, tuple)) or any(
+            not isinstance(item, str) for item in runs
+        ):
             raise StateError(
-                f"snapshot{where}: 'last_changed_at' must be a string or null"
+                f"snapshot{where}: 'action_runs' must be a list of timestamps"
             )
+        values["action_runs"] = tuple(runs)
 
         for name in _COUNT_FIELDS:
             count = values[name]
@@ -131,11 +168,14 @@ def load(path: Path) -> Snapshot | None:
         raise StateError(f"{path} does not contain a JSON object")
 
     version = data.get("version")
-    if version != STATE_VERSION:
+    if version not in READABLE_VERSIONS:
+        readable = ", ".join(str(v) for v in READABLE_VERSIONS)
         raise StateError(
             f"{path} was written by state version {version!r}, but this build "
-            f"reads version {STATE_VERSION}. Delete the file to re-baseline."
+            f"reads version(s) {readable}. Delete the file to re-baseline."
         )
+    # A v1 snapshot is upgraded in place by from_dict's defaults, and written
+    # back as v2 on the next save.
     return Snapshot.from_dict(data.get("snapshot"), source=path)
 
 

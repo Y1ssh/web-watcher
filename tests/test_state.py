@@ -122,6 +122,98 @@ class CorruptStateTests(TempDirTestCase):
             load(self.path)
 
 
+class VersionTwoTests(TempDirTestCase):
+    """Slice 2 added notification and action bookkeeping to the snapshot."""
+
+    def test_new_fields_default_to_empty(self):
+        self.assertIsNone(SAMPLE.last_notified_hash)
+        self.assertIsNone(SAMPLE.last_notified_at)
+        self.assertEqual(SAMPLE.action_runs, ())
+        self.assertEqual(SAMPLE.action_total_runs, 0)
+
+    def test_new_fields_survive_a_round_trip(self):
+        snapshot = Snapshot(**{
+            **SAMPLE.to_dict(),
+            "last_notified_hash": "deadbeef",
+            "last_notified_at": "2000-01-01T00:20:00Z",
+            "action_runs": ("2000-01-01T00:20:00Z",),
+            "action_total_runs": 1,
+        })
+        save(self.path, snapshot)
+        loaded = load(self.path)
+        self.assertEqual(loaded.last_notified_hash, "deadbeef")
+        self.assertEqual(loaded.action_runs, ("2000-01-01T00:20:00Z",))
+        self.assertEqual(loaded.action_total_runs, 1)
+
+    def test_action_runs_is_stored_as_a_list_and_read_back_as_a_tuple(self):
+        save(self.path, Snapshot(**{**SAMPLE.to_dict(), "action_runs": ("a", "b")}))
+        stored = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["snapshot"]["action_runs"], ["a", "b"])
+        self.assertEqual(load(self.path).action_runs, ("a", "b"))
+
+    def test_a_version_one_file_is_upgraded_rather_than_rejected(self):
+        # Losing the baseline on an upgrade would mean missing the next real
+        # change, so a v1 snapshot is read with the new fields defaulted.
+        v1 = {
+            name: value
+            for name, value in SAMPLE.to_dict().items()
+            if name not in (
+                "last_notified_hash",
+                "last_notified_at",
+                "action_runs",
+                "action_total_runs",
+            )
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps({"version": 1, "snapshot": v1}), encoding="utf-8"
+        )
+        loaded = load(self.path)
+        self.assertEqual(loaded.value, "In Stock")
+        self.assertEqual(loaded.check_count, 2)
+        self.assertIsNone(loaded.last_notified_hash)
+        self.assertEqual(loaded.action_runs, ())
+
+    def test_an_upgraded_snapshot_is_written_back_as_the_current_version(self):
+        v1 = {
+            name: value
+            for name, value in SAMPLE.to_dict().items()
+            if name not in (
+                "last_notified_hash",
+                "last_notified_at",
+                "action_runs",
+                "action_total_runs",
+            )
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps({"version": 1, "snapshot": v1}), encoding="utf-8"
+        )
+        save(self.path, load(self.path))
+        stored = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["version"], STATE_VERSION)
+
+    def test_a_malformed_action_runs_list_is_rejected(self):
+        broken = {**SAMPLE.to_dict(), "action_runs": [1, 2, 3]}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps({"version": STATE_VERSION, "snapshot": broken}),
+            encoding="utf-8",
+        )
+        with self.assertRaises(StateError):
+            load(self.path)
+
+    def test_a_wrongly_typed_notify_hash_is_rejected(self):
+        broken = {**SAMPLE.to_dict(), "last_notified_hash": 42}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps({"version": STATE_VERSION, "snapshot": broken}),
+            encoding="utf-8",
+        )
+        with self.assertRaises(StateError):
+            load(self.path)
+
+
 class ClearTests(TempDirTestCase):
     def test_clear_removes_the_file(self):
         save(self.path, SAMPLE)

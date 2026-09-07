@@ -7,5 +7,18 @@
   "interval_seconds": 900,
   "timeout_seconds": 20,
   "state_path": "state/snapshot.json",
-  "log_path": "logs/runs.jsonl"
+  "log_path": "logs/runs.jsonl",
+
+  "condition": {
+    "kind": "changed"
+  },
+
+  "notify": {
+    "channels": [
+      { "kind": "console" },
+      { "kind": "file", "path": "logs/notifications.log" }
+    ],
+    "once_per_value": true,
+    "warn_on_unknown": true
+  }
 }

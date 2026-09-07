@@ -41,6 +41,10 @@ class LocalSite:
         #: Set to raw bytes to bypass UTF-8 encoding (for charset tests).
         self.body_override: bytes | None = None
         self.request_count = 0
+        #: Every POST/PUT/PATCH received, so a test can assert on what was sent.
+        self.received: list[dict] = []
+        #: Status returned to writes; set to 500 to make an action fail.
+        self.write_status = 200
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -71,6 +75,30 @@ class LocalSite:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def do_POST(self):  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+                self._record_write()
+
+            def do_PUT(self):  # noqa: N802
+                self._record_write()
+
+            def do_PATCH(self):  # noqa: N802
+                self._record_write()
+
+            def _record_write(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                site.received.append({
+                    "method": self.command,
+                    "path": self.path,
+                    "headers": dict(self.headers),
+                    "body": body.decode("utf-8", errors="replace"),
+                })
+                self.send_response(site.write_status)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
 
             def _redirect_to(self, location: str) -> None:
                 self.send_response(302)

@@ -1,4 +1,4 @@
-"""Command line for the watcher: check, watch, show, reset."""
+"""Command line for the watcher: check, watch, show, reset, test-notify."""
 
 import argparse
 import dataclasses
@@ -8,7 +8,20 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
-from . import checker, config as config_module, extract, runlog, schedule, state
+from . import (
+    actions,
+    checker,
+    clock,
+    config as config_module,
+    extract,
+    notify,
+    runlog,
+    schedule,
+    secrets,
+    state,
+)
+from .actions import ActionStatus
+from .conditions import Verdict
 from .detect import Outcome
 from .errors import ConfigError, ExtractionError, FetchError, StateError
 
@@ -35,7 +48,8 @@ _HEADLINE = {
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m watcher",
-        description="Watch one value on one web page and report when it changes.",
+        description="Watch one value on one web page, alert when it changes, "
+                    "and optionally act on it.",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -46,12 +60,14 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_common_arguments(check)
+    _add_dry_run(check)
 
     watch = subcommands.add_parser(
         "watch", help="check repeatedly on the configured interval",
         epilog=_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_common_arguments(watch)
+    _add_dry_run(watch)
     watch.add_argument(
         "--interval",
         type=int,
@@ -89,6 +105,17 @@ def build_parser() -> argparse.ArgumentParser:
     reset.add_argument(
         "--yes", action="store_true", help="required, to confirm the deletion"
     )
+    reset.add_argument(
+        "--action-only",
+        action="store_true",
+        help="clear only the action guards, keeping the value baseline",
+    )
+
+    test_notify = subcommands.add_parser(
+        "test-notify",
+        help="send a sample notification now, without waiting for a change",
+    )
+    _add_common_arguments(test_notify)
 
     return parser
 
@@ -110,13 +137,25 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_dry_run(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="force the action into rehearsal mode for this run. There is no "
+             "opposite flag: only the config file can permit a real action.",
+    )
+
+
 def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     out = stream if stream is not None else sys.stdout
 
     try:
-        settings = _load_config(args)
+        secrets.load_env_file(
+            args.config.parent / secrets.DEFAULT_ENV_FILENAME
+        )
+        settings = _bind_console(_load_config(args), out)
     except ConfigError as exc:
         print(f"config error: {exc}", file=out)
         return EXIT_CONFIG
@@ -126,6 +165,7 @@ def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int
         "watch": _command_watch,
         "show": _command_show,
         "reset": _command_reset,
+        "test-notify": _command_test_notify,
     }
     try:
         return handlers[args.command](settings, args, out)
@@ -137,8 +177,33 @@ def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int
         return EXIT_OK
 
 
+def _bind_console(
+    settings: config_module.Config, out: TextIO
+) -> config_module.Config:
+    """Point console notifications at the same stream the CLI is writing to.
+
+    The channel is built by the config loader, which has no idea where output
+    is going. Binding it here keeps an alert and the check that caused it in
+    the same place.
+    """
+    if not any(
+        isinstance(channel, notify.ConsoleChannel)
+        for channel in settings.notify_channels
+    ):
+        return settings
+    channels = tuple(
+        notify.ConsoleChannel(out)
+        if isinstance(channel, notify.ConsoleChannel)
+        else channel
+        for channel in settings.notify_channels
+    )
+    return dataclasses.replace(settings, notify_channels=channels)
+
+
 def _load_config(args: argparse.Namespace) -> config_module.Config:
-    settings = config_module.load(args.config)
+    settings = config_module.load(
+        args.config, force_dry_run=bool(getattr(args, "dry_run", False))
+    )
     overrides: dict[str, Any] = {}
     if args.url:
         overrides["url"] = args.url
@@ -155,11 +220,50 @@ def _load_config(args: argparse.Namespace) -> config_module.Config:
     return dataclasses.replace(settings, **overrides) if overrides else settings
 
 
+def _confirm_fn(out: TextIO):
+    """Ask on the terminal, or return None when there is no terminal to ask."""
+    if not sys.stdin or not sys.stdin.isatty():
+        return None
+
+    def ask(description: str) -> bool:
+        print(f"\nAbout to perform: {description}", file=out)
+        try:
+            answer = input("Type 'go' to continue, anything else to cancel: ")
+        except (EOFError, KeyboardInterrupt):
+            # isatty() can still be true with nothing on the other end. Read
+            # silence as "no": never perform a real action on an unanswered
+            # prompt.
+            print("\nno answer received, so the action was not performed", file=out)
+            return False
+        return answer.strip().lower() == "go"
+
+    return ask
+
+
+def _print_mode_banner(settings: config_module.Config, out: TextIO) -> None:
+    """Say plainly, before anything happens, whether an action can fire."""
+    if settings.action is None:
+        return
+    guards = settings.action.safeguards
+    if guards.dry_run:
+        print(
+            "SANDBOX ON - the action will be rehearsed, nothing will really be sent",
+            file=out,
+        )
+    else:
+        print(
+            f"LIVE - the action WILL really be performed: "
+            f"{settings.action.describe()}",
+            file=out,
+        )
+
+
 def _command_check(
     settings: config_module.Config, args: argparse.Namespace, out: TextIO
 ) -> int:
+    _print_mode_banner(settings, out)
     try:
-        result = checker.run_check(settings)
+        result = checker.run_check(settings, confirm_fn=_confirm_fn(out))
     except (FetchError, ExtractionError) as exc:
         print(f"check failed: {exc}", file=out)
         return EXIT_FETCH
@@ -174,16 +278,19 @@ def _command_watch(
         print("--max-runs must be at least 1", file=out)
         return EXIT_CONFIG
 
+    _print_mode_banner(settings, out)
     print(
         f"watching {settings.describe_target()} "
-        f"every {settings.interval_seconds}s "
+        f"every {settings.interval_seconds}s, "
+        f"alerting when {settings.describe_condition()} "
         f"(Ctrl+C to stop)",
         file=out,
     )
     failures = 0
+    confirm = _confirm_fn(out)
 
     def one_run() -> None:
-        _report(checker.run_check(settings), out)
+        _report(checker.run_check(settings, confirm_fn=confirm), out)
 
     def on_error(exc: BaseException) -> None:
         nonlocal failures
@@ -215,15 +322,23 @@ def _command_show(
         print(json.dumps(snapshot.to_dict(), indent=2, sort_keys=True), file=out)
     else:
         print(f"watching:    {settings.describe_target()}", file=out)
+        print(f"alert when:  {settings.describe_condition()}", file=out)
         print(f"value:       {extract.truncate(snapshot.value)}", file=out)
         print(f"first seen:  {snapshot.first_seen_at}", file=out)
         print(f"last check:  {snapshot.last_checked_at}", file=out)
         print(f"last change: {snapshot.last_changed_at or 'never'}", file=out)
+        print(f"last alert:  {snapshot.last_notified_at or 'never'}", file=out)
         print(
             f"counts:      {snapshot.check_count} check(s), "
             f"{snapshot.change_count} change(s)",
             file=out,
         )
+        print(
+            f"channels:    "
+            f"{', '.join(c.describe() for c in settings.notify_channels) or 'none'}",
+            file=out,
+        )
+        _show_action(settings, snapshot, out)
         if snapshot.fingerprint != settings.fingerprint:
             print(
                 "note:        the config no longer matches this snapshot, so "
@@ -239,9 +354,30 @@ def _command_show(
     return EXIT_OK
 
 
+def _show_action(
+    settings: config_module.Config, snapshot: state.Snapshot, out: TextIO
+) -> None:
+    if settings.action is None:
+        print("action:      none configured", file=out)
+        return
+    guards = settings.action.safeguards
+    mode = "sandbox (dry run)" if guards.dry_run else "LIVE"
+    print(f"action:      {settings.action.describe()}", file=out)
+    print(f"action mode: {mode}", file=out)
+    print(
+        f"action runs: {snapshot.action_total_runs} total, "
+        f"{actions.runs_in_last_24h(snapshot.action_runs, clock.now_iso())} "
+        f"in the last 24h (limit {guards.max_per_24h})",
+        file=out,
+    )
+
+
 def _command_reset(
     settings: config_module.Config, args: argparse.Namespace, out: TextIO
 ) -> int:
+    if args.action_only:
+        return _reset_action_only(settings, args, out)
+
     if not args.yes:
         print(
             f"this deletes {settings.state_path}, so the next check records a "
@@ -257,6 +393,71 @@ def _command_reset(
     return EXIT_OK
 
 
+def _reset_action_only(
+    settings: config_module.Config, args: argparse.Namespace, out: TextIO
+) -> int:
+    snapshot = state.load(settings.state_path)
+    if snapshot is None:
+        print(f"nothing stored at {settings.state_path}", file=out)
+        return EXIT_OK
+    if not args.yes:
+        print(
+            f"this clears the action guards ({snapshot.action_total_runs} "
+            f"recorded run(s)), allowing the action to fire again.\n"
+            f"re-run with --yes to confirm.",
+            file=out,
+        )
+        return EXIT_CONFIG
+    state.save(
+        settings.state_path,
+        dataclasses.replace(snapshot, action_runs=(), action_total_runs=0),
+    )
+    print("action guards cleared; the action may fire again", file=out)
+    return EXIT_OK
+
+
+def _command_test_notify(
+    settings: config_module.Config, args: argparse.Namespace, out: TextIO
+) -> int:
+    """Prove the notification path works without waiting for a real change."""
+    if not settings.notify_channels:
+        print(
+            "no notify channels are configured, so there is nothing to test.\n"
+            "add a 'notify.channels' list to your config.",
+            file=out,
+        )
+        return EXIT_CONFIG
+
+    note = notify.build_notification(
+        {
+            "url": settings.url,
+            "value": "SAMPLE-NEW-VALUE",
+            "previous_value": "SAMPLE-OLD-VALUE",
+            "outcome": "changed",
+            "condition": settings.describe_condition(),
+            "condition_reason": "this is a test, no real check was performed",
+            "at": clock.now_iso(),
+        },
+        subject_template=settings.notify_subject,
+        body_template=settings.notify_body,
+        is_test=True,
+    )
+    deliveries = notify.deliver(list(settings.notify_channels), note)
+    print("test notification results:", file=out)
+    for delivery in deliveries:
+        print(f"  {delivery.summary}", file=out)
+
+    if all(delivery.sent for delivery in deliveries):
+        print("\nall channels accepted the message.", file=out)
+        return EXIT_OK
+    print(
+        "\nat least one channel failed. Check the detail above, and confirm "
+        "the environment variables it needs are set.",
+        file=out,
+    )
+    return EXIT_FETCH
+
+
 def _report(result: checker.Check, out: TextIO) -> None:
     print(_HEADLINE[result.outcome], file=out)
     print(f"  url:   {result.page_url}", file=out)
@@ -266,3 +467,20 @@ def _report(result: checker.Check, out: TextIO) -> None:
     else:
         print(f"  value: {extract.truncate(result.value)}", file=out)
     print(f"  saved: {result.snapshot.last_checked_at}", file=out)
+
+    verdict = result.decision.verdict
+    label = {
+        Verdict.TRUE: "MET",
+        Verdict.FALSE: "not met",
+        Verdict.UNKNOWN: "UNKNOWN",
+    }[verdict]
+    print(f"  rule:  {label} - {result.decision.reason}", file=out)
+
+    for delivery in result.deliveries:
+        print(f"  alert: {delivery.summary}", file=out)
+
+    if result.action is not None and result.action.status is not ActionStatus.SKIPPED:
+        marker = "DONE" if result.action.status is ActionStatus.PERFORMED else (
+            result.action.status.value
+        )
+        print(f"  action: {marker} - {result.action.reason}", file=out)

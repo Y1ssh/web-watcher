@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import extract, state
+from . import actions, conditions, extract, notify, state
 from .errors import ConfigError
 from .fetching import DEFAULT_TIMEOUT_SECONDS, DEFAULT_USER_AGENT
 
@@ -27,6 +27,10 @@ MIN_INTERVAL_SECONDS = 1
 DEFAULT_STATE_PATH = "state/snapshot.json"
 DEFAULT_LOG_PATH = "logs/runs.jsonl"
 
+#: With no condition set, the watcher behaves as it did in slice 1: it reacts
+#: to any change and nothing else.
+DEFAULT_CONDITION: dict[str, Any] = {"kind": "changed"}
+
 ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 _ALLOWED_KEYS = frozenset({
@@ -37,6 +41,13 @@ _ALLOWED_KEYS = frozenset({
     "user_agent",
     "state_path",
     "log_path",
+    "condition",
+    "notify",
+    "action",
+})
+
+_NOTIFY_KEYS = frozenset({
+    "channels", "subject", "body", "once_per_value", "warn_on_unknown",
 })
 
 
@@ -53,16 +64,41 @@ class Config:
     log_path: Path = Path(DEFAULT_LOG_PATH)
     source: Path | None = None
 
+    # -- slice 2 ----------------------------------------------------------
+    condition: dict[str, Any] = field(
+        default_factory=lambda: dict(DEFAULT_CONDITION)
+    )
+    notify_channels: tuple[notify.Channel, ...] = ()
+    notify_subject: str = notify.DEFAULT_SUBJECT
+    notify_body: str = notify.DEFAULT_BODY
+    #: Alert once per distinct value, not once per check. Without this a
+    #: fifteen-minute schedule would re-send the same alert ninety-six times.
+    notify_once_per_value: bool = True
+    #: Tell me when the condition could not be evaluated at all.
+    warn_on_unknown: bool = True
+    action: actions.Action | None = None
+
     @property
     def fingerprint(self) -> str:
-        """Identifies what this config watches. See state.fingerprint."""
+        """Identifies what this config watches. See state.fingerprint.
+
+        Deliberately covers only `url` and `extractor`. Editing a condition or
+        a notification channel does not change what is being measured, so it
+        must not throw away the baseline.
+        """
         return state.fingerprint(self.url, self.extractor)
 
     def describe_target(self) -> str:
         return f"{extract.describe(self.extractor)} at {self.url}"
 
+    def describe_condition(self) -> str:
+        return conditions.describe(self.condition)
 
-def load(path: Path) -> Config:
+    def build_condition(self) -> conditions.Condition:
+        return conditions.build_condition(self.condition)
+
+
+def load(path: Path, *, force_dry_run: bool = False) -> Config:
     """Read and validate a config file."""
     if not path.exists():
         raise ConfigError(
@@ -79,11 +115,17 @@ def load(path: Path) -> Config:
     except json.JSONDecodeError as exc:
         raise ConfigError(f"{path} is not valid JSON: {exc}") from exc
 
-    return from_mapping(data, base_dir=path.parent, source=path)
+    return from_mapping(
+        data, base_dir=path.parent, source=path, force_dry_run=force_dry_run
+    )
 
 
 def from_mapping(
-    data: Any, *, base_dir: Path, source: Path | None = None
+    data: Any,
+    *,
+    base_dir: Path,
+    source: Path | None = None,
+    force_dry_run: bool = False,
 ) -> Config:
     """Validate an already-parsed configuration mapping."""
     if not isinstance(data, Mapping):
@@ -108,6 +150,18 @@ def from_mapping(
     # kind, an unknown key, a broken regex, or an impossible element target.
     extract.build_extractor(extractor)
 
+    condition = data.get("condition", DEFAULT_CONDITION)
+    conditions.build_condition(condition)
+
+    notify_settings = _read_notify(data.get("notify", {}), base_dir)
+
+    action_spec = data.get("action")
+    action = (
+        actions.build_action(action_spec, force_dry_run=force_dry_run)
+        if action_spec is not None
+        else None
+    )
+
     return Config(
         url=url,
         extractor=dict(extractor),
@@ -117,7 +171,48 @@ def from_mapping(
         state_path=_read_path(data, "state_path", DEFAULT_STATE_PATH, base_dir),
         log_path=_read_path(data, "log_path", DEFAULT_LOG_PATH, base_dir),
         source=source,
+        condition=dict(condition),
+        action=action,
+        **notify_settings,
     )
+
+
+def _read_notify(spec: Any, base_dir: Path) -> dict[str, Any]:
+    if not isinstance(spec, Mapping):
+        raise ConfigError("'notify' must be an object")
+
+    unknown = sorted(set(spec) - _NOTIFY_KEYS)
+    if unknown:
+        allowed = ", ".join(sorted(_NOTIFY_KEYS))
+        raise ConfigError(
+            f"notify: unknown key(s) {', '.join(unknown)}; allowed keys are "
+            f"{allowed}"
+        )
+
+    raw_channels = spec.get("channels", [{"kind": "console"}])
+    if not isinstance(raw_channels, (list, tuple)):
+        raise ConfigError("notify: 'channels' must be a list")
+    channels = tuple(
+        notify.build_channel(channel, base_dir=base_dir) for channel in raw_channels
+    )
+
+    subject = spec.get("subject", notify.DEFAULT_SUBJECT)
+    body = spec.get("body", notify.DEFAULT_BODY)
+    for name, template in (("subject", subject), ("body", body)):
+        if not isinstance(template, str) or not template:
+            raise ConfigError(f"notify: {name!r} must be a non-empty string")
+
+    for name in ("once_per_value", "warn_on_unknown"):
+        if name in spec and not isinstance(spec[name], bool):
+            raise ConfigError(f"notify: {name!r} must be true or false")
+
+    return {
+        "notify_channels": channels,
+        "notify_subject": subject,
+        "notify_body": body,
+        "notify_once_per_value": bool(spec.get("once_per_value", True)),
+        "warn_on_unknown": bool(spec.get("warn_on_unknown", True)),
+    }
 
 
 def _read_url(data: Mapping[str, Any]) -> str:
